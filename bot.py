@@ -18,7 +18,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 
 # Конфигурация
-BOT_TOKEN = 'ваш_токен_бота'  # Замените на свой токен
+BOT_TOKEN = '8401771674:AAED5znl3dlONZ6nc8bx0-r_PgOTr8u67Hk'  # Замените на свой токен
 CRYPTOBOT_TOKEN = '505975:AAWB2WYvz4wJuseOm4nrs875jo4ORUJl7ww'
 ADMIN_ID = 7037764178
 API_ID = 30147101
