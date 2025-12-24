@@ -20,7 +20,7 @@ import re
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneNumberInvalidError
 import phonenumbers
-from cryptobot_api import Api
+from cryptobot import Api
 import random
 from typing import List, Dict
 
