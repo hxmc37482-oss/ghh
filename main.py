@@ -1179,25 +1179,24 @@ async def inline_mode(inline_query: types.InlineQuery):
         dc_id = account_info.get('dc_id', 0)
         username_display = account_info.get('username', query)
         
-        # Создаем inline запрос в БД
-        request_id = add_inline_request(user_id, inline_query.id, username_display, account_id, dc_id)
+        # Генерируем уникальный ID для результата
+        result_id = f"{username_display}_{inline_query.id[:8]}"
         
+        # Создаем результат с кнопкой для запуска
         result = types.InlineQueryResultArticle(
-            id=query,
+            id=result_id,
             title=f"Снос аккаунта @{username_display}",
-            description="Нажмите чтобы отправить запрос на снос",
+            description=f"ID: {account_id} | DC: {dc_id if dc_id else 'Неизвестно'}",
             input_message_content=types.InputTextMessageContent(
-                message_text=f"🚀 Начат процесс сноса аккаунта @{username_display}\n\n"
+                message_text=f"🚀 Готов к сносу аккаунта @{username_display}\n\n"
                             f"🆔 ID жертвы: {account_id}\n"
-                            f"🌐 Датацентр: DC{dc_id if dc_id else 'Неизвестно'}\n"
-                            f"📝 ID запроса: #{request_id}\n"
-                            f"⏱️ Статус: 🟡 Ожидание запуска..."
+                            f"🌐 Датацентр: DC{dc_id if dc_id else 'Неизвестно'}\n\n"
+                            f"Нажмите кнопку ниже для запуска процесса сноса ⬇️"
             ),
-            reply_markup=get_inline_keyboard_for_request(str(request_id))
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🚀 Запустить снос", callback_data=f"inline_start_{username_display}_{account_id}_{dc_id}")
+            ]])
         )
-        
-        # Запускаем процесс сноса в фоне
-        asyncio.create_task(process_inline_request(inline_query.id, request_id, username_display, account_id))
         
     else:
         result = types.InlineQueryResultArticle(
@@ -1212,10 +1211,53 @@ async def inline_mode(inline_query: types.InlineQuery):
     
     await inline_query.answer([result], cache_time=1)
 
-async def process_inline_request(inline_message_id: str, request_id: int, username: str, target_id: int):
-    """Обработка inline запроса в фоне"""
-    steps = [ 
-("📡 Отправка запросов с сессий session 4044...", 1),
+@dp.callback_query(F.data.startswith("inline_start_"))
+async def start_inline_snos(callback: types.CallbackQuery):
+    """Обработка запуска сноса через inline"""
+    try:
+        # Парсим данные из callback_data
+        parts = callback.data.replace("inline_start_", "").split("_")
+        if len(parts) < 3:
+            await callback.answer("❌ Ошибка данных", show_alert=True)
+            return
+        
+        username = parts[0]
+        target_id = int(parts[1])
+        dc_id = int(parts[2]) if parts[2].isdigit() else 0
+        
+        user_id = callback.from_user.id
+        
+        # Проверяем подписку
+        sub_info = get_user_subscription_status(user_id)
+        if not sub_info['has_subscription']:
+            await callback.answer("❌ У вас нет активной подписки", show_alert=True)
+            return
+        
+        # Создаем запрос в БД
+        request_id = add_request(user_id, username, target_id, dc_id, f"Inline request for @{username}")
+        
+        # Обновляем сообщение с прогрессом
+        await callback.message.edit_text(
+            f"🚀 Начат процесс сноса аккаунта @{username}\n\n"
+            f"🆔 ID жертвы: {target_id}\n"
+            f"🌐 Датацентр: DC{dc_id if dc_id else 'Неизвестно'}\n"
+            f"📝 ID запроса: #{request_id}\n\n"
+            f"⏱️ Статус: 🟡 Подготовка..."
+        )
+        
+        await callback.answer("🚀 Процесс сноса запущен!")
+        
+        # Запускаем процесс в фоне
+        asyncio.create_task(process_inline_snos(callback.message, username, target_id, request_id))
+        
+    except Exception as e:
+        logger.error(f"❌ Ошибка в inline_start: {e}")
+        await callback.answer("❌ Ошибка запуска сноса", show_alert=True)
+
+async def process_inline_snos(message: types.Message, username: str, target_id: int, request_id: int):
+    """Обработка сноса для inline режима"""
+    steps = [
+        ("📡 Отправка запросов с сессий session 4044...", 1),
         ("🔍 Отправка запросов с сессий session 4046 ...", 1),
         ("📊 Отправка запросов с сессий session 4073...", 1),
         ("🚫 Отправка запросов с сессий session 3121...", 1),
@@ -1226,46 +1268,24 @@ async def process_inline_request(inline_message_id: str, request_id: int, userna
         await asyncio.sleep(delay)
         progress = int(((i + 1) / len(steps)) * 100)
         
-        # Обновляем прогресс в БД
-        update_inline_request_progress(inline_message_id, progress)
-        
         # Создаем прогресс бар
         bars = int(progress / 10)
         progress_bar = "█" * bars + "░" * (10 - bars)
         
-        # Формируем обновленное сообщение
-        message_text = f"""
-🚀 Процесс сноса аккаунта @{username}
-
-🆔 ID жертвы: {target_id}
-📝 ID запроса: #{request_id}
-⏱️ Статус: {step_text}
-
-[{progress_bar}] {progress}%
-"""
-        
-        # Отправляем обновление через answerInlineQuery
+        # Обновляем сообщение
         try:
-            await bot.answer_inline_query(
-                inline_query_id=inline_message_id,
-                results=[
-                    types.InlineQueryResultArticle(
-                        id=username,
-                        title=f"Снос аккаунта @{username}",
-                        description=f"Прогресс: {progress}%",
-                        input_message_content=types.InputTextMessageContent(
-                            message_text=message_text
-                        ),
-                        reply_markup=get_inline_keyboard_for_request(str(request_id))
-                    )
-                ],
-                cache_time=1
+            await message.edit_text(
+                f"🚀 Процесс сноса аккаунта @{username}\n\n"
+                f"🆔 ID жертвы: {target_id}\n"
+                f"📝 ID запроса: #{request_id}\n"
+                f"⏱️ Статус: {step_text}\n\n"
+                f"[{progress_bar}] {progress}%"
             )
         except Exception as e:
-            logger.error(f"❌ Error updating inline query: {e}")
+            logger.error(f"❌ Ошибка обновления inline сообщения: {e}")
     
-    # Финальное обновление
-    final_message = f"""
+    # Финальное сообщение
+    final_text = f"""
 ✅ Процесс сноса аккаунта @{username} завершен!
 
 🆔 ID жертвы: {target_id}
@@ -1276,53 +1296,15 @@ async def process_inline_request(inline_message_id: str, request_id: int, userna
 ща ебнет.
 """
     
-    update_inline_request_progress(inline_message_id, 100, "completed")
-    
     try:
-        await bot.answer_inline_query(
-            inline_query_id=inline_message_id,
-            results=[
-                types.InlineQueryResultArticle(
-                    id=username,
-                    title=f"✅ Снос @{username} завершен",
-                    description="Запрос успешно отправлен",
-                    input_message_content=types.InputTextMessageContent(
-                        message_text=final_message
-                    ),
-                    reply_markup=get_inline_keyboard_for_request(str(request_id))
-                )
-            ],
-            cache_time=1
+        await message.edit_text(
+            final_text,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="🔄 Новый запрос", switch_inline_query_current_chat="")
+            ]])
         )
     except Exception as e:
-        logger.error(f"❌ Error sending final inline update: {e}")
-
-@dp.callback_query(F.data.startswith("refresh_"))
-async def refresh_inline_status(callback: types.CallbackQuery):
-    request_id = callback.data.replace("refresh_", "")
-    
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT progress, status FROM inline_requests WHERE id = ?', (request_id,))
-    result = cursor.fetchone()
-    conn.close()
-    
-    if result:
-        progress = result['progress']
-        status = result['status']
-        
-        bars = int(progress / 10)
-        progress_bar = "█" * bars + "░" * (10 - bars)
-        
-        status_text = {
-            'pending': '🟡 Ожидание запуска',
-            'processing': '🟠 В процессе',
-            'completed': '✅ Завершен'
-        }.get(status, '❓ Неизвестно')
-        
-        await callback.answer(f"Статус: {status_text}\nПрогресс: {progress}%", show_alert=True)
-    else:
-        await callback.answer("Запрос не найден", show_alert=True)
+        logger.error(f"❌ Ошибка отправки финального сообщения: {e}")
 
 # ========== АДМИН ПАНЕЛЬ ==========
 @dp.callback_query(F.data == "admin_stats")
